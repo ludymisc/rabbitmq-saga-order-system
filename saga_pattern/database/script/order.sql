@@ -13,3 +13,19 @@ CREATE TABLE order_log (
 	status order_status DEFAULT 'pending'
 );
 
+CREATE TABLE outbox(
+id BIGSERIAL PRIMARY KEY,
+message_id UUID NOT NULL UNIQUE,
+aggregate_id TEXT NOT NULL,
+event_type TEXT NOT NULL,
+payload JSONB NOT NULL,
+created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+published_at TIMESTAMPTZ
+);
+
+CREATE INDEX outbox_published ON outbox (id) WHERE published_at IS NULL;
+
+CREATE TABLE processed_message(
+message_id UUID PRIMARY KEY,
+processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

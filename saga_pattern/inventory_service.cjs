@@ -1,90 +1,81 @@
 const amqp = require('amqplib');
-const {pool_inventory, pool_order, pool_payment} = require('./database/config/db.cjs')
+const { pool_inventory } = require('./database/config/db.cjs');
+const { writeOutbox, startRelay, consumeIdempotent } = require('./outbox.cjs');
 
-const main = async() => {
-    const connection = await amqp.connect("amqp://localhost");
-    const channel = await connection.createChannel();
-    const exchange = "market";
-    const queue = "inventory"
-
-    await channel.assertExchange(exchange, 'topic', {
-        durable: true,
+const main = async () => {
+    const connection = await amqp.connect('amqp://localhost');
+    connection.on('close', () => {
+        console.error('[Inventory] RabbitMQ connection closed, exiting');
+        process.exit(1);
     });
 
-    const q = await channel.assertQueue(queue, {
-        exclusive: false,
-    });
+    const channel = await connection.createConfirmChannel();
+    const exchange = 'market';
+    const queue = 'inventory';
 
-    const routingKeys = ['order.created', 'order.failed'];
+    await channel.assertExchange(exchange, 'topic', { durable: true });
+    await channel.assertQueue(queue, { durable: true });
 
-    
-    channel.consume(q.queue, async(msg) => {
-        if(msg !== null) {
-            try{
-                const routingKey = msg.fields.routingKey
-                const rawMessage = msg.content.toString();
-                const orderData = JSON.parse(rawMessage);
+    // order.created -> try to reserve stock
+    // stock.release -> compensation after a failed payment
+    for (const key of ['order.created', 'stock.release']) {
+        await channel.bindQueue(queue, exchange, key);
+        console.log(`[Setup] Queue '${queue}' di-bind ke key: '${key}'`);
+    }
+    channel.prefetch(10);
 
-                const orderId = orderData.order_id;
-                const itemName = orderData.items[0].item_name;
-                const itemQty = orderData.items[0].quantity;
-                console.log(orderData)
+    startRelay({ pool: pool_inventory, channel, exchange });
 
-                console.log(`[Inventory] received from order : {item: ${itemName}, qty: ${itemQty}}`);
+    consumeIdempotent({
+        channel,
+        queue,
+        pool: pool_inventory,
+        handler: async (client, data, routingKey) => {
+            const orderId = data.order_id;
+            const { item_name: itemName, quantity: qty } = data.items[0];
 
-                if (routingKey === 'order.failed') {
-                    console.log(`[Inventory] ${orderId} payment faied, restoring ${itemQty} of ${itemName}`);
-                    await pool_inventory.query(
-                        `UPDATE inventory SET stock = stock + $1 WHERE name = $2`,
-                        [itemQty, itemName]
-                    );
-
-                    console.log(`[Inventory] ${orderId} stock restored`);
-                    channel.ack(msg);
-                    return;
-                }
-
-                const query = `SELECT * FROM inventory WHERE name = $1`;
-                const result = await pool_inventory.query(query, [itemName]);
-
-                const no_item_message = JSON.stringify({
-                    status: "error",
-                    code: "OUT_OF_STOCK",
-                    message: `[Inventory] The stock of item (${itemName}) is not enough for your order`
-                });
-                const no_stock_message = JSON.stringify({
-                    status: "error",
-                    code: "ITEM_UNAVAILABLE",
-                    message: `[Inventory] The stock of item you are looking for (${itemName}) is not enough for your order`
-                });
-
-                if(result.rows.length === 0) {
-                    await pool_order.query(`UPDATE order_log SET status = $1 WHERE id = $2`, ['failed', orderId]);
-                    channel.publish(exchange, 'order.failed', Buffer.from(no_item_message.toString()),
-                    {persistent: true});
-                } else {
-                    const currentStock = result.rows[0].stock;
-                    console.log("Barang ditemukan, memeriksa stock...");
-
-                    if(currentStock >= itemQty) {
-                        console.log(`[Inventory] ${orderId}stock mencukupi, reservasi akan dilakukan`);
-                        const query = `UPDATE inventory SET stock = stock - $1 WHERE name = $2`;
-                        await pool_inventory.query(query, [itemQty, itemName]);
-                        channel.publish(exchange, 'payment.request', Buffer.from(rawMessage),
-                        {persistent: true});
-                    } else {
-                        console.log(no_stock_message);
-                        await pool_order.query(`UPDATE order_log SET status = $1 WHERE id = $2`, ['failed', orderId]);
-                        channel.publish(exchange, 'order.failed', Buffer.from(no_stock_message.toString()),
-                        {persistent: true});
-                    }
-                }
-                channel.ack(msg);
-            } catch (err) {
-                console.error(err.message);
-                channel.nack(msg, false, false);
+            // ---- Compensation: payment failed, give the stock back ----
+            if (routingKey === 'stock.release') {
+                await client.query(
+                    `UPDATE inventory SET stock = stock + $1, updated_at = now() WHERE name = $2`,
+                    [qty, itemName]
+                );
+                console.log(`[Inventory] ${orderId} stock restored (${qty} x ${itemName})`);
+                return;
             }
-        }
-    })
-}
+
+            // ---- Reserve: one atomic statement, no check-then-update race ----
+            const reserved = await client.query(
+                `UPDATE inventory
+                 SET stock = stock - $1, updated_at = now()
+                 WHERE name = $2 AND stock >= $1
+                 RETURNING id`,
+                [qty, itemName]
+            );
+
+            if (reserved.rowCount === 1) {
+                console.log(`[Inventory] ${orderId} stock reserved (${qty} x ${itemName})`);
+                await writeOutbox(client, orderId, 'payment.request', data);
+                return;
+            }
+
+            // Reservation failed: work out why, then tell the order service.
+            const exists = await client.query(
+                `SELECT 1 FROM inventory WHERE name = $1`,
+                [itemName]
+            );
+            const failure =
+                exists.rowCount === 0
+                    ? { code: 'ITEM_UNAVAILABLE', reason: `Item (${itemName}) tidak ditemukan` }
+                    : { code: 'OUT_OF_STOCK', reason: `Stock item (${itemName}) tidak cukup untuk ${qty} pcs` };
+
+            console.log(`[Inventory] ${orderId} ${failure.code}`);
+            await writeOutbox(client, orderId, 'order.failed', {
+                order_id: orderId,
+                ...failure,
+            });
+        },
+    });
+};
+ 
 main();

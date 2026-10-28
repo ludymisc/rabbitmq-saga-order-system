@@ -1,67 +1,77 @@
 const amqp = require('amqplib');
-const {
-    pool_order, 
-    pool_inventory, 
-    pool_payment
-} = require('./database/config/db.cjs');
+const { pool_payment } = require('./database/config/db.cjs');
+const { writeOutbox, startRelay, consumeIdempotent } = require('./outbox.cjs');
 
-const main = async() => {
-    const connection = await amqp.connect("amqp://localhost");
-    const channel = await connection.createChannel();
-    const exchange = "market";
-    const queue = "payment";
+const SUCCESS_RATE = 0.7;
 
-    await channel.assertExchange(exchange, 'topic', {
-        durable: true,
+const main = async () => {
+    const connection = await amqp.connect('amqp://localhost');
+    connection.on('close', () => {
+        console.error('[Payment] RabbitMQ connection closed, exiting');
+        process.exit(1);
     });
 
-    const q = await channel.assertQueue(queue, {
-        exclusive: false,
-    });
+    const channel = await connection.createConfirmChannel();
+    const exchange = 'market';
+    const queue = 'payment';
 
-    await channel.bindQueue(q.queue, exchange, 'payment.request');
-    
-    channel.consume(q.queue, async (msg) => {
-        if (msg !== null) {
-            console.log(" [x] %s: %s", msg.fields.routingKey, msg.content.toString());
-            try{
-                const rawMessage = msg.content.toString();
-                const orderData = JSON.parse(rawMessage);
+    await channel.assertExchange(exchange, 'topic', { durable: true });
+    await channel.assertQueue(queue, { durable: true });
+    await channel.bindQueue(queue, exchange, 'payment.request');
+    channel.prefetch(10);
 
-                const targetItem = orderData.items[0].item_name;
-                const requestQty = orderData.items[0].quantity;
-                const orderId = orderData.order_id;
+    startRelay({ pool: pool_payment, channel, exchange });
 
-                console.log(`[Payment] waiting payment for order : {item: ${targetItem}, qty: ${requestQty}}`);
+    consumeIdempotent({
+        channel,
+        queue,
+        pool: pool_payment,
+        handler: async (client, data) => {
+            const orderId = data.order_id;
+            const { item_name: itemName, quantity } = data.items[0];
 
-                const isSuccess = Math.random() < 0.7;
-                const status = isSuccess ? 'success' : 'failed';
+            console.log(`[Payment] processing order ${orderId} (${quantity} x ${itemName})`);
 
-                console.log(`[Payment] proses payment ${status}, meneruskan pesan ke order_log terminal`);
+            // Decided inside the transaction: if anything below fails, the whole
+            // thing rolls back and a retry simply rolls the dice again.
+            const isSuccess = Math.random() < SUCCESS_RATE;
+            const status = isSuccess ? 'completed' : 'failed';
 
-                const insertData = await pool_payment.query(`INSERT INTO payment_log(order_id, status) 
-                    VALUES($1, $2) ON CONFLICT (order_id) DO NOTHING RETURNING order_id`,[orderId, status]);   
-                if(insertData.rowCount === 0) {
-                    console.log(`[Payment] order ${orderId} already processed, skipping`);
-                    return;
-                }
-
-                const orderStatus = isSuccess? 'completed' : 'failed';
-                await pool_order.query(`
-                    UPDATE order_log SET status = $1 WHERE id = $2`, 
-                    [orderStatus, orderId]);
-
-                const key = isSuccess ? 'order.completed' : 'order.failed'
-                channel.publish(exchange, key, 
-                    Buffer.from(JSON.stringify({ order_id: orderId, items: orderData.items })));
-            }catch(err) {
-                console.error(err.message);
+            // Business-key guard in addition to message-level dedupe.
+            const inserted = await client.query(
+                `INSERT INTO payment_log(order_id, status)
+                 VALUES($1, $2)
+                 ON CONFLICT (order_id) DO NOTHING
+                 RETURNING order_id`,
+                [orderId, status]
+            );
+            if (inserted.rowCount === 0) {
+                console.log(`[Payment] order ${orderId} already has a payment, skipping`);
+                return;
             }
-        }
-        channel.ack(msg);
-    }, {
-        noAck: false,
+ 
+            if (isSuccess) {
+                console.log(`[Payment] ${orderId} success`);
+                await writeOutbox(client, orderId, 'order.completed', {
+                    order_id: orderId,
+                    items: data.items,
+                });
+            } else {
+                console.log(`[Payment] ${orderId} failed`);
+                // Tell the order service it failed...
+                await writeOutbox(client, orderId, 'order.failed', {
+                    order_id: orderId,
+                    code: 'PAYMENT_FAILED',
+                    reason: 'Pembayaran ditolak',
+                });
+                // ...and tell inventory to undo the reservation.
+                await writeOutbox(client, orderId, 'stock.release', {
+                    order_id: orderId,
+                    items: data.items,
+                });
+            }
+        },
     });
-}
+};
 
 main();

@@ -1,60 +1,52 @@
 const amqp = require('amqplib');
-const {pool_order} = require('./database/config/db.cjs');
-
-const main = async() => {
-    const connection = await amqp.connect("amqp://localhost");
-    const channel = await connection.createChannel();
-    const exchange = "market";
-    const queue = "order";
-
-    await channel.assertExchange(exchange, 'topic', {
-        durable: true,
+const { pool_order } = require('./database/config/db.cjs');
+const { startRelay, consumeIdempotent } = require('./outbox.cjs');
+ 
+const main = async () => {
+    const connection = await amqp.connect('amqp://localhost');
+    connection.on('close', () => {
+        console.error('[Order] RabbitMQ connection closed, exiting');
+        process.exit(1);
     });
 
-    const q = await channel.assertQueue(queue, {
-        exclusive: false,
+    // Confirm channel: needed so the relay can wait for broker acks.
+    const channel = await connection.createConfirmChannel();
+    const exchange = 'market';
+    const queue = 'order';
+
+    await channel.assertExchange(exchange, 'topic', { durable: true });
+    await channel.assertQueue(queue, { durable: true });
+
+    // Order service only listens for the final outcome of a saga.
+    for (const key of ['order.completed', 'order.failed']) {
+        await channel.bindQueue(queue, exchange, key);
+        console.log(`[Setup] Queue '${queue}' di-bind ke key: '${key}'`);
+    }
+    channel.prefetch(10);
+ 
+    // Publishes order.created rows written by order.cjs.
+    startRelay({ pool: pool_order, channel, exchange });
+
+    consumeIdempotent({
+        channel,
+        queue,
+        pool: pool_order,
+        handler: async (client, data, routingKey) => {
+            const status = routingKey === 'order.completed' ? 'completed' : 'failed';
+
+            // Only move pending -> final; never overwrite a final state.
+            const res = await client.query(
+                `UPDATE order_log SET status = $1 WHERE id = $2 AND status = 'pending'`,
+                [status, data.order_id]
+            );
+
+            console.log(
+                `[Order] ${data.order_id} -> ${status}` +
+                (res.rowCount === 0 ? ' (already final, ignored)' : '') +
+                (data.reason ? ` | ${data.code}: ${data.reason}` : '')
+            );
+        },
     });
-
-    const routingKeys = ['order.place', 'order.completed', 'order.failed'];
-
-    for (const key of routingKeys) {
-        await channel.bindQueue(q.queue, exchange, key);
-        console.log(`[Setup] Queue '${q.queue}' berhasil di-bind ke key: '${key}'`);
-    };
-
-    channel.consume(q.queue, async (msg) => {
-        if(msg === null) return;
-        const routingKey = msg.fields.routingKey;
-        const rawMessage = msg.content.toString();
-        console.log("[Order] [*] %s: %s", routingKey, rawMessage);
-
-        if (routingKey === 'order.place') {
-            const orderData = JSON.parse(rawMessage);
-            const targetItem = orderData.items[0].item_name;
-            const requestQty = orderData.items[0].quantity;
-            
-            const query = `
-            INSERT INTO order_log(name, quantity) 
-            VALUES($1, $2) 
-            ON CONFLICT (id) DO NOTHING 
-            RETURNING id`;
-            const result = await pool_order.query(query, [targetItem, requestQty]);
-            const orderId = result.rows[0].id;
-
-            if (result.rowCount === 0) {
-                console.log(`[Order] Order dengan ID ${orderId} sudah pernah diproses. Pesan duplikat diabaikan.`);
-                
-                channel.ack(msg);
-                return;
-            }
-
-            const enriched = { ...orderData, order_id: orderId};
-            channel.publish(exchange, 'order.created', Buffer.from(JSON.stringify(enriched)));
-        }
-    channel.ack(msg);
-    }, {
-        noAck: false,
-    });
-}
+};
 
 main();

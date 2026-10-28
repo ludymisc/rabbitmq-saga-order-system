@@ -2,6 +2,7 @@
   "dependencies": {
     "amqplib": "^2.2.0",
     "commander": "^15.0.0",
+    "crypto": "^1.0.1",
     "dotenv": "^18.0.8",
     "pg": "^8.23.1"
   }
